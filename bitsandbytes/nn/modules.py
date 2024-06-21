@@ -14,7 +14,11 @@ import bitsandbytes as bnb
 from bitsandbytes.autograd._functions import get_tile_inds, undo_layout
 from bitsandbytes.functional import QuantState
 from bitsandbytes.optim import GlobalOptimManager
-from bitsandbytes.utils import OutlierTracer
+from bitsandbytes.utils import (
+    INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING,
+    LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING,
+    OutlierTracer,
+)
 
 T = TypeVar("T", bound="torch.nn.Module")
 
@@ -232,7 +236,7 @@ class Params4bit(torch.nn.Parameter):
         return self
 
     def __getstate__(self):
-        state = self.__dict__
+        state = self.__dict__.copy()
         state["data"] = self.data
         state["requires_grad"] = self.requires_grad
         return state
@@ -556,13 +560,12 @@ class Int8Params(torch.nn.Parameter):
         CB=None,
         SCB=None,
     ):
-        cls.has_fp16_weights = has_fp16_weights
-        cls.CB = None
-        cls.SCB = None
         if data is None:
             data = torch.empty(0)
         obj = torch.Tensor._make_subclass(cls, data, requires_grad)
-        obj.CB, obj.SCB = cls.CB, cls.SCB
+        obj.CB = CB
+        obj.SCB = SCB
+        obj.has_fp16_weights = has_fp16_weights
         return obj
 
     def cuda(self, device):
@@ -580,6 +583,18 @@ class Int8Params(torch.nn.Parameter):
             self.SCB = SCB
 
         return self
+
+    def __deepcopy__(self, memo):
+        # adjust this if new arguments are added to the constructor
+        new_instance = type(self).__new__(
+            type(self),
+            data=copy.deepcopy(self.data, memo),
+            requires_grad=self.requires_grad,
+            has_fp16_weights=self.has_fp16_weights,
+            CB=copy.deepcopy(self.CB, memo),
+            SCB=copy.deepcopy(self.SCB, memo),
+        )
+        return new_instance
 
     @overload
     def to(
@@ -618,6 +633,16 @@ def maybe_rearrange_weight(state_dict, prefix, local_metadata, strict, missing_k
         # if the state dict has no weights for this layer (e.g., LoRA finetuning), do nothing
         return
     weight_format = state_dict.pop(f"{prefix}weight_format", "row")
+
+    if isinstance(weight_format, torch.Tensor):
+        weight_format = weight_format.item()
+
+    # For new weights format storage type, we explicitly check
+    # if weights_format is on the mapping
+    if isinstance(weight_format, int) and weight_format not in INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING:
+        raise ValueError(f"Expected supported weight format - got {weight_format}")
+    elif isinstance(weight_format, int) and weight_format in INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING:
+        weight_format = INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING[weight_format]
 
     if weight_format != "row":
         tile_indices = get_tile_inds(weight_format, weight.device)
@@ -711,13 +736,20 @@ class Linear8bitLt(nn.Linear):
         if not self.state.has_fp16_weights:
             if param_from_weight is not None:
                 destination[key_name] = param_from_weight if keep_vars else param_from_weight.detach()
-                destination[format_name] = "row"
+                destination[format_name] = torch.tensor(0, dtype=torch.uint8)
             elif param_from_state is not None and not layout_reordered:
                 destination[key_name] = param_from_state if keep_vars else param_from_state.detach()
-                destination[format_name] = "row"
+                destination[format_name] = torch.tensor(0, dtype=torch.uint8)
             elif param_from_state is not None:
                 destination[key_name] = param_from_state if keep_vars else param_from_state.detach()
-                destination[format_name] = self.state.formatB
+                weights_format = self.state.formatB
+                # At this point `weights_format` is an str
+                if weights_format not in LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING:
+                    raise ValueError(f"Unrecognized weights format {weights_format}")
+
+                weights_format = LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING[weights_format]
+
+                destination[format_name] = torch.tensor(weights_format, dtype=torch.uint8)
 
     def _load_from_state_dict(
         self,
