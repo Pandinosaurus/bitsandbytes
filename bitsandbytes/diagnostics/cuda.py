@@ -1,12 +1,11 @@
+from collections.abc import Iterable, Iterator
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Iterator
 
 import torch
 
-from bitsandbytes.cextension import get_cuda_bnb_library_path
-from bitsandbytes.consts import NONPYTORCH_DOC_URL
+from bitsandbytes.cextension import HIP_ENVIRONMENT, get_cuda_bnb_library_path
 from bitsandbytes.cuda_specs import CUDASpecs
 from bitsandbytes.diagnostics.utils import print_dedented
 
@@ -33,9 +32,16 @@ CUDART_PATH_IGNORED_ENVVARS = {
 }
 
 CUDA_RUNTIME_LIB_PATTERNS = (
-    "cudart64*.dll",  # Windows
-    "libcudart*.so*",  # libcudart.so, libcudart.so.11.0, libcudart.so.12.0, libcudart.so.12.1, libcudart.so.12.2 etc.
-    "nvcuda*.dll",  # Windows
+    (
+        "libamdhip64.so*",  # Linux
+        "amdhip64*.dll",  # Windows
+    )
+    if HIP_ENVIRONMENT
+    else (
+        "cudart64*.dll",  # Windows
+        "libcudart*.so*",  # libcudart.so, libcudart.so.11.0, libcudart.so.12.0, libcudart.so.12.1, libcudart.so.12.2 etc.
+        "nvcuda*.dll",  # Windows
+    )
 )
 
 logger = logging.getLogger(__name__)
@@ -57,7 +63,7 @@ def find_cuda_libraries_in_path_list(paths_list_candidate: str) -> Iterable[Path
                 pass
             for lib_pattern in CUDA_RUNTIME_LIB_PATTERNS:
                 for pth in dir.glob(lib_pattern):
-                    if pth.is_file():
+                    if pth.is_file() and not pth.is_symlink():
                         yield pth
         except (OSError, PermissionError):
             pass
@@ -76,7 +82,7 @@ def is_relevant_candidate_env_var(env_var: str, value: str) -> bool:
     )
 
 
-def get_potentially_lib_path_containing_env_vars() -> Dict[str, str]:
+def get_potentially_lib_path_containing_env_vars() -> dict[str, str]:
     return {env_var: value for env_var, value in os.environ.items() if is_relevant_candidate_env_var(env_var, value)}
 
 
@@ -104,7 +110,7 @@ def find_cudart_libraries() -> Iterator[Path]:
         yield from find_cuda_libraries_in_path_list(value)
 
 
-def print_cuda_diagnostics(cuda_specs: CUDASpecs) -> None:
+def _print_cuda_diagnostics(cuda_specs: CUDASpecs) -> None:
     print(
         f"PyTorch settings found: CUDA_VERSION={cuda_specs.cuda_version_string}, "
         f"Highest Compute Capability: {cuda_specs.highest_compute_capability}.",
@@ -114,28 +120,13 @@ def print_cuda_diagnostics(cuda_specs: CUDASpecs) -> None:
     if not binary_path.exists():
         print_dedented(
             f"""
-        Library not found: {binary_path}. Maybe you need to compile it from source?
-        If you compiled from source, try again with `make CUDA_VERSION=DETECTED_CUDA_VERSION`,
-        for example, `make CUDA_VERSION=113`.
-
-        The CUDA version for the compile might depend on your conda install, if using conda.
-        Inspect CUDA version via `conda list | grep cuda`.
-        """,
-        )
-
-    cuda_major, cuda_minor = cuda_specs.cuda_version_tuple
-    if cuda_major < 11:
-        print_dedented(
-            """
-            WARNING: CUDA versions lower than 11 are currently not supported for LLM.int8().
-            You will be only to use 8-bit optimizers and quantization routines!
+            No compatible CUDA library found (tried: {binary_path.name}). You may need to compile from source:
+            https://huggingface.co/docs/bitsandbytes/main/en/installation#cuda-compile
             """,
         )
 
-    print(f"To manually override the PyTorch CUDA version please see: {NONPYTORCH_DOC_URL}")
-
-    # 7.5 is the minimum CC for cublaslt
-    if not cuda_specs.has_cublaslt:
+    # 7.5 is the minimum CC for int8 tensor cores
+    if not cuda_specs.has_imma:
         print_dedented(
             """
             WARNING: Compute capability < 7.5 detected! Only slow 8-bit matmul is supported for your GPU!
@@ -144,33 +135,59 @@ def print_cuda_diagnostics(cuda_specs: CUDASpecs) -> None:
             """,
         )
 
-    # TODO:
-    # (1) CUDA missing cases (no CUDA installed by CUDA driver (nvidia-smi accessible)
-    # (2) Multiple CUDA versions installed
+
+def _print_hip_diagnostics(cuda_specs: CUDASpecs) -> None:
+    print(f"PyTorch settings found: ROCM_VERSION={cuda_specs.cuda_version_string}")
+
+    rocm_override = os.environ.get("BNB_ROCM_VERSION")
+    if rocm_override:
+        print(f"BNB_ROCM_VERSION override: {rocm_override}")
+
+    binary_path = get_cuda_bnb_library_path(cuda_specs)
+    if not binary_path.exists():
+        print_dedented(
+            f"""
+            No compatible ROCm library found (tried: {binary_path.name}). You may need to compile from source:
+            https://huggingface.co/docs/bitsandbytes/main/en/installation#rocm-compile
+            Use BNB_ROCM_VERSION to force a specific version if needed.
+            """,
+        )
+
+    hip_major, hip_minor = cuda_specs.cuda_version_tuple
+    if (hip_major, hip_minor) < (6, 1):
+        print_dedented(
+            """
+            WARNING: bitsandbytes is fully supported only from ROCm 6.1.
+            """,
+        )
 
 
-def print_cuda_runtime_diagnostics() -> None:
+def print_diagnostics(cuda_specs: CUDASpecs) -> None:
+    if HIP_ENVIRONMENT:
+        _print_hip_diagnostics(cuda_specs)
+    else:
+        _print_cuda_diagnostics(cuda_specs)
+
+
+def print_runtime_diagnostics() -> None:
+    backend = "ROCm" if HIP_ENVIRONMENT else "CUDA"
+    runtime_version = torch.version.hip if HIP_ENVIRONMENT else torch.version.cuda
+    override_var = "BNB_ROCM_VERSION" if HIP_ENVIRONMENT else "BNB_CUDA_VERSION"
+    override_example = "72" if HIP_ENVIRONMENT else "122"
+
     cudart_paths = list(find_cudart_libraries())
     if not cudart_paths:
-        print("CUDA SETUP: WARNING! CUDA runtime files not found in any environmental path.")
+        print(f"{backend} SETUP: WARNING! {backend} runtime files not found in any environmental path.")
     elif len(cudart_paths) > 1:
         print_dedented(
             f"""
-            Found duplicate CUDA runtime files (see below).
+            Found duplicate {backend} runtime files (see below).
 
-            We select the PyTorch default CUDA runtime, which is {torch.version.cuda},
-            but this might mismatch with the CUDA version that is needed for bitsandbytes.
-            To override this behavior set the `BNB_CUDA_VERSION=<version string, e.g. 122>` environmental variable.
-
-            For example, if you want to use the CUDA version 122,
-                BNB_CUDA_VERSION=122 python ...
-
-            OR set the environmental variable in your .bashrc:
-                export BNB_CUDA_VERSION=122
-
-            In the case of a manual override, make sure you set LD_LIBRARY_PATH, e.g.
-            export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-11.2,
+            bitsandbytes will use PyTorch's {backend} runtime ({runtime_version}) and auto-select
+            the closest available library version. If you need to force a specific version,
+            set {override_var}, e.g.:
+                export {override_var}={override_example}
             """,
         )
         for pth in cudart_paths:
-            print(f"* Found CUDA runtime at: {pth}")
+            print(f"* Found {backend} runtime at: {pth}")

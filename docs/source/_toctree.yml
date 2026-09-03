@@ -2,16 +2,15 @@
   sections:
   - local: index
     title: bitsandbytes
-  - local: quickstart
-    title: Quickstart
   - local: installation
     title: Installation
-- title: Guides
+  - local: quickstart
+    title: Quickstart
+
+- title: Usage Guides
   sections:
   - local: optimizers
     title: 8-bit optimizers
-  - local: algorithms
-    title: Algorithms
   - local: fsdp_qlora
     title: FSDP-QLoRA
   - local: integrations
@@ -30,6 +29,8 @@
     title: Papers, resources & how to cite
 - title: API reference
   sections:
+  - title: Functional
+    local: reference/functional
   - title: Optimizers
     sections:
     - local: reference/optim/optim_overview
@@ -40,6 +41,8 @@
       title: Adam
     - local: reference/optim/adamw
       title: AdamW
+    - local: reference/optim/ademamix
+      title: AdEMAMix
     - local: reference/optim/lamb
       title: LAMB
     - local: reference/optim/lars
@@ -50,10 +53,10 @@
       title: RMSprop
     - local: reference/optim/sgd
       title: SGD
-  - title: k-bit quantizers
+  - title: Modules
     sections:
     - local: reference/nn/linear8bit
-      title: 8-bit quantizer
+      title: LLM.int8()
     - local: reference/nn/linear4bit
       title: 4-bit quantizer
     - local: reference/nn/embeddings

@@ -1,11 +1,12 @@
 version: 2
 updates:
-  - package-ecosystem: pip
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
-      major:
-        update-types: [major]
-      minor-patch:
-        update-types: [minor, patch]
+      actions:
+        patterns:
+          - "*"
